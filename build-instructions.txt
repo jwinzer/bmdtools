@@ -1,0 +1,80 @@
+-----------------------------------
+Build nginx with nginx-rtmp-module
+-----------------------------------
+
+1. Download nginx
+
+cd /home/nciadmin
+mkdir ~/nginx
+cd nginx
+curl http://nginx.org/download/nginx-1.19.4.tar.gz --output nginx-1.19.4.tar.gz
+tar -xf nginx-1.19.4.tar.gz
+
+2. Modify files
+
+src/core/nginx.c
+
+3. Clone nginx-rtmp-module
+
+git clone https://github.com/arut/nginx-rtmp-module.git
+
+4. Add and modify files
+
+ngx_rtmp_cmd_module.c
+ngx_rtmp_codec_module.h
+ngx_rtmp_live_module.c
+ngx_rtmp_cc.c
+ngx_rtmp_cc.h
+config
+
+5. Build nginx
+
+sudo apt install build-essential libpcre3 libpcre3-dev libssl-dev
+cd nginx-1.19.4
+./configure --add-module=/home/nciadmin/nginx/nginx-rtmp-module
+make
+sudo make install
+
+
+-------------
+Build ffmpeg
+-------------
+
+sudo apt install yasm g++ libx264-dev
+cd /home/nciadmin
+git clone https://github.com/FFmpeg/FFmpeg.git
+cd FFmpeg
+./configure --enable-shared --enable-gpl --enable-version3 --enable-libx264
+make
+sudo make install
+sudo ldconfig
+
+-----------------
+Build bmdcapture
+-----------------
+
+1. Clone bmdtools
+
+cd /home/nciadmin
+git clone https://github.com/lu-zero/bmdtools.git
+
+2. Add and modify files
+
+bmdcapture.cpp
+CEA708_Decoder.cpp
+CEA708_Decoder.h
+Makefile
+
+3. Downlad Blackmagic_DeckLink_SDK_10.8.3
+
+4. Build and install
+
+sudo apt install libavformat-dev libswscale-dev
+make SDK_PATH=/home/nciadmin/blackmagic/Blackmagic_DeckLink_SDK_10.8.3/Linux/include/
+sudo make install SDK_PATH=/home/nciadmin/blackmagic/Blackmagic_DeckLink_SDK_10.8.3/Linux/include/
+
+
+
+
+
+
