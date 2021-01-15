@@ -25,7 +25,7 @@
 #** -LICENSE-END-
 
 prefix ?= /usr
-bindir ?= $(prefix)/bin
+bindir ?= $(prefix)/local/bin
 
 CXX = g++
 SDK_PATH = ../../include
@@ -54,7 +54,7 @@ COMMON_FILES = modes.cpp $(SDK_PATH)/DeckLinkAPIDispatch.cpp
 
 all: $(PROGRAMS)
 
-bmdcapture: bmdcapture.cpp $(COMMON_FILES)
+bmdcapture: bmdcapture.cpp CEA708_Decoder.cpp $(COMMON_FILES)
 	$(CXX) -o $@ $^ $(CXXFLAGS) $(LDFLAGS)
 
 bmdplay: bmdplay.cpp $(COMMON_FILES)

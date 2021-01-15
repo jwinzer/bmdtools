@@ -28,11 +28,14 @@
 #include <fcntl.h>
 #include <time.h>
 #include <signal.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #include "compat.h"
 #include "DeckLinkAPI.h"
 #include "Capture.h"
 #include "modes.h"
+#include "CEA708_Decoder.h"
 extern "C" {
 #include "libavformat/avformat.h"
 #include "libavutil/time.h"
@@ -42,6 +45,13 @@ pthread_mutex_t sleepMutex;
 pthread_cond_t sleepCond;
 int videoOutputFile = -1;
 int audioOutputFile = -1;
+int audioSocket     = -1;
+int captionSocket   = -1;
+int captionFile     = -1;
+bool connected      = false;
+
+struct sockaddr_un audioSockAddr;
+struct sockaddr_un captSockAddr;
 
 IDeckLink *deckLink;
 IDeckLinkInput *deckLinkInput;
@@ -60,6 +70,12 @@ static int wallclock             = 0;
 static int draw_bars             = 1;
 bool g_verbose                   = false;
 unsigned long long g_memoryLimit = 1024 * 1024 * 1024;            // 1GByte(>50 sec)
+
+// Options added by NCI for audio and closed-captions capture
+static int g_vancLine        = 0;
+static char *g_audioSockPath = NULL;
+static char *g_captSockPath  = NULL;
+static char *g_captLogPath   = NULL;
 
 static unsigned long frameCount = 0;
 static unsigned int dropped     = 0, totaldropped = 0;
@@ -328,11 +344,15 @@ void write_audio_packet(IDeckLinkAudioInputPacket *audioFrame)
     AVPacket pkt;
     BMDTimeValue audio_pts;
     void *audioFrameBytes;
+    void *monoData;
+    uint16_t *src16, *dst16;
+    uint32_t *src32, *dst32;
+    int frameCount, i;
 
     av_init_packet(&pkt);
 
-    pkt.size = audioFrame->GetSampleFrameCount() *
-               g_audioChannels * (g_audioSampleDepth / 8);
+    frameCount = audioFrame->GetSampleFrameCount();
+    pkt.size = frameCount * g_audioChannels * (g_audioSampleDepth / 8);
     audioFrame->GetBytes(&audioFrameBytes);
     audioFrame->GetPacketTime(&audio_pts, audio_st->time_base.den);
     pkt.pts = audio_pts / audio_st->time_base.num;
@@ -349,6 +369,25 @@ void write_audio_packet(IDeckLinkAudioInputPacket *audioFrame)
     pkt.data         = (uint8_t *)audioFrameBytes;
 
     avpacket_queue_put(&queue, &pkt);
+
+    // NCI: Write PCM audio samples of ONE channel to audio socket.
+    if (audioSocket > 0) {
+        monoData = malloc(pkt.size / g_audioChannels);
+        if (monoData != NULL) {
+            if (g_audioSampleDepth == 16) {
+                for (i = frameCount, src16 = (uint16_t *)pkt.data, dst16 = (uint16_t *)monoData; i > 0; i--, src16 += g_audioChannels, dst16++) {
+                    *dst16 = *src16;
+                }
+            }
+            else if (g_audioSampleDepth == 32) {
+                for (i = frameCount, src32 = (uint32_t *)pkt.data, dst32 = (uint32_t *)monoData; i > 0; i--, src32 += g_audioChannels, dst32++) {
+                    *dst32 = *src32;
+                }
+            }
+            write(audioSocket, (void *)monoData, pkt.size / g_audioChannels);
+            free(monoData);
+        }
+    }
 }
 
 void write_video_packet(IDeckLinkVideoInputFrame *videoFrame,
@@ -458,6 +497,47 @@ HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(
             snprintf(line, sizeof(line), "%" PRId64, t);
             write_data_packet(line, strlen(line), pts);
         }
+
+        // NCI: Capture CC data from VANC line.
+        if (g_vancLine > 0) {
+            // Delay making a socket connection for 60 frames.
+            if (captionSocket >= 0 && !connected) {
+                if (frameCount >= 60) {
+                    if (connect(captionSocket, (struct sockaddr*)&captSockAddr, sizeof(captSockAddr)) == -1) {
+                        fprintf(stderr, "Socket connect error for \"%s\": %s\n", captSockAddr.sun_path, strerror(errno));
+                        captionSocket = -2;
+                    } else {
+                        // fprintf(stdout, "Connected to %s", captSockAddr.sun_path);
+                        connected = true;
+                    }
+                }
+            }
+
+            IDeckLinkVideoFrameAncillary* ancillary;
+            if (videoFrame->GetAncillaryData(&ancillary) == S_OK)
+            {
+                HRESULT hr;
+                void* lineBuffer;
+                if ((hr = ancillary->GetBufferForVerticalBlankingLine(g_vancLine, (void**)&lineBuffer)) == S_OK)
+                {
+                    CEA708::Decoder decoder((uint32_t*)lineBuffer, videoFrame->GetRowBytes());
+                    while (decoder.GetCaptionDistributionPacket())
+                    {
+                        uint16_t ccWord = decoder.Get608Captions() & 0x7f7f;    // remove parity
+                        if (ccWord)
+                        {
+                            if (captionFile > 0) {
+                                write(captionFile, &ccWord, 2);
+                            }
+                            if (captionSocket > 0 && connected) {
+                                write(captionSocket, &ccWord, 2);
+                            }
+                        }
+                    }
+                }
+                ancillary->Release(); // must be released
+            }
+        }
     }
 
     // Handle Audio Frame
@@ -555,6 +635,12 @@ int usage(int status)
         "    -d <filler>          When the source is offline draw a black frame or color bars\n"
         "                         0: black frame\n"
         "                         1: color bars\n"
+        "NCI extended options:\n"
+        "    -a <Unix socket>     Unix socket PCM audio samples will be written to\n"
+        "    -L <VANC line>       VANC line number closed-captions will be read from\n"
+        "    -u <Unix socket>     Unix socket closed-captions will be written to\n"
+        "    -l <filename>        Closed-captions log file\n"
+        "\n"
         "Capture video and audio to a file.\n"
         "Raw video and audio can be sent to a pipe to avconv or vlc e.g.:\n"
         "\n"
@@ -618,7 +704,7 @@ int main(int argc, char *argv[])
     }
 
     // Parse command line options
-    while ((ch = getopt(argc, argv, "?hvc:s:f:a:m:n:p:M:F:C:A:V:o:w:S:d:")) != -1) {
+    while ((ch = getopt(argc, argv, "?hvc:s:f:a:m:n:p:M:F:C:A:V:o:w:S:d:L:u:l:")) != -1) {
         switch (ch) {
         case 'v':
             g_verbose = true;
@@ -728,6 +814,19 @@ int main(int argc, char *argv[])
             break;
         case 'd':
             draw_bars = atoi(optarg);
+            break;
+        // NCI extended options
+        case 'a':
+            g_audioSockPath = optarg;
+            break;
+        case 'L':
+            g_vancLine = atoi(optarg);
+            break;
+        case 'u':
+            g_captSockPath = optarg;
+            break;
+        case 'l':
+            g_captLogPath = optarg;
             break;
         case '?':
         case 'h':
@@ -850,6 +949,49 @@ int main(int argc, char *argv[])
         usage(0);
     }
 
+    // NCI audio capture extension.
+    if (g_audioSockPath != NULL) {
+        // Create Unix socket.
+        if ((audioSocket = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+            fprintf(stderr, "Socket create error for \"%s\": %s\n", g_audioSockPath, strerror(errno));
+            goto bail;
+        }
+        memset(&audioSockAddr, 0, sizeof(audioSockAddr));
+        audioSockAddr.sun_family = AF_UNIX;
+        strncpy(audioSockAddr.sun_path, g_audioSockPath, sizeof(audioSockAddr.sun_path)-1);
+        // Connect to the socket.
+        if (connect(audioSocket, (struct sockaddr*)&audioSockAddr, sizeof(audioSockAddr)) == -1) {
+            fprintf(stderr, "Socket connect error for \"%s\": %s\n", audioSockAddr.sun_path, strerror(errno));
+            goto bail;
+        }
+    }
+
+    // NCI CC capture extension.
+    if (g_vancLine > 0)
+    {
+        if (g_captSockPath != NULL) {
+            // Create Unix socket.
+            if ((captionSocket = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+                fprintf(stderr, "Socket create error \"%s\": %s\n", g_captSockPath, strerror(errno));
+                goto bail;
+            }
+            memset(&captSockAddr, 0, sizeof(captSockAddr));
+            captSockAddr.sun_family = AF_UNIX;
+            strncpy(captSockAddr.sun_path, g_captSockPath, sizeof(captSockAddr.sun_path)-1);
+
+            // Delay making a socket connection until a number of frames have been received.
+        }
+        if (g_captLogPath != NULL) {
+            // Create and open caption log file.
+            captionFile = open(g_captLogPath, O_WRONLY|O_CREAT|O_TRUNC, 0664);
+            if (captionFile < 0)
+            {
+                fprintf(stderr, "Could not open caption log file \"%s\"\n", g_captLogPath);
+                goto bail;
+            }
+        }
+    }
+
     while (displayModeIterator->Next(&displayMode) == S_OK) {
         if (g_videoModeIndex == displayModeCount) {
             selectedDisplayMode = displayMode->GetDisplayMode();
@@ -934,6 +1076,9 @@ int main(int argc, char *argv[])
     avpacket_queue_end(&queue);
 
 bail:
+    if (captionFile != 0)
+        close(captionFile);
+
     if (displayModeIterator != NULL) {
         displayModeIterator->Release();
         displayModeIterator = NULL;
